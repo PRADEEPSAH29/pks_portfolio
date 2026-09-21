@@ -296,45 +296,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
     }
 
-    $history = normalizeHistory($input['history'] ?? []);
+    /*
+     * Gemini Interactions API.
+     * The browser sends only the previous interaction ID.
+     * The Gemini API key stays on the PHP server.
+     */
+    $previousInteractionId = trim((string)($input['previous_interaction_id'] ?? ''));
 
-    $contents = $history;
-    $contents[] = [
-        'role' => 'user',
-        'parts' => [['text' => $prompt]],
-    ];
+    if ($previousInteractionId !== '' &&
+        !preg_match('/^[A-Za-z0-9_.:-]{1,300}$/', $previousInteractionId)) {
+        $previousInteractionId = '';
+    }
 
     $payload = [
-        'system_instruction' => [
-            'parts' => [
-                ['text' => buildSystemInstruction($cvData)],
-            ],
-        ],
-        'contents' => $contents,
-        'generationConfig' => [
+        'model' => AI_MODEL,
+        'input' => $prompt,
+        'system_instruction' => buildSystemInstruction($cvData),
+        'generation_config' => [
             'temperature' => 0.45,
-            'topP' => 0.9,
-            'maxOutputTokens' => 500,
+            'max_tokens' => 500,
         ],
     ];
+
+    if ($previousInteractionId !== '') {
+        $payload['previous_interaction_id'] = $previousInteractionId;
+    }
+
+    try {
+        $jsonPayload = json_encode(
+            $payload,
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+        );
+    } catch (JsonException) {
+        jsonResponse([
+            'status' => 'error',
+            'message' => 'Could not prepare the AI request.',
+        ], 500);
+    }
 
     $ch = curl_init(AI_API_URL . '?key=' . rawurlencode($apiKey));
 
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        CURLOPT_POSTFIELDS => $jsonPayload,
         CURLOPT_HTTPHEADER => [
             'Content-Type: application/json',
             'Accept: application/json',
+            'x-goog-api-key: ' . $apiKey,
         ],
         CURLOPT_CONNECTTIMEOUT => 8,
-        CURLOPT_TIMEOUT => 25,
+        CURLOPT_TIMEOUT => 45,
     ]);
 
     $response = curl_exec($ch);
     $curlError = curl_error($ch);
-    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
     if ($response === false || $curlError !== '') {
@@ -343,6 +360,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'message' => 'The AI service could not be reached. Please try again.',
         ], 503);
     }
+
+    try {
+        $data = json_decode($response, true, 512, JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        jsonResponse([
+            'status' => 'error',
+            'message' => 'The AI service returned an invalid response.',
+        ], 502);
+    }
+
+    if ($httpCode < 200 || $httpCode >= 300) {
+        $apiMessage = $data['error']['message'] ?? 'The AI service returned an error.';
+
+        jsonResponse([
+            'status' => 'error',
+            'message' => mb_substr((string) $apiMessage, 0, 300),
+        ], $httpCode >= 400 && $httpCode < 600 ? $httpCode : 502);
+    }
+
+    /*
+     * Interactions API response:
+     * steps[] -> model_output -> content[] -> text
+     */
+    $reply = '';
+    $interactionId = (string) ($data['id'] ?? '');
+
+    foreach (($data['steps'] ?? []) as $step) {
+        if (!is_array($step) || ($step['type'] ?? '') !== 'model_output') {
+            continue;
+        }
+
+        foreach (($step['content'] ?? []) as $content) {
+            if (
+                is_array($content) &&
+                ($content['type'] ?? '') === 'text' &&
+                isset($content['text']) &&
+                is_string($content['text'])
+            ) {
+                $reply .= $content['text'];
+            }
+        }
+    }
+
+    $reply = trim($reply);
+
+    if ($reply === '') {
+        jsonResponse([
+            'status' => 'error',
+            'message' => 'The AI returned an empty response. Please try another question.',
+        ], 502);
+    }
+
+    jsonResponse([
+        'status' => 'success',
+        'reply' => $reply,
+        'interaction_id' => $interactionId,
+    ]);
 
     try {
         $data = json_decode($response, true, 512, JSON_THROW_ON_ERROR);
@@ -1073,7 +1147,7 @@ const clearChatBtn = document.getElementById('clear-chat');
 const sendText = document.getElementById('send-text');
 const sendIcon = document.getElementById('send-icon');
 
-let chatHistory = [];
+let previousInteractionId = null;
 
 function scrollChat() {
     chatBox.scrollTop = chatBox.scrollHeight;
@@ -1162,7 +1236,7 @@ async function askAI(prompt) {
             body: JSON.stringify({
                 action: 'chat',
                 prompt: prompt,
-                history: chatHistory
+                previous_interaction_id: previousInteractionId
             })
         });
 
@@ -1182,12 +1256,9 @@ async function askAI(prompt) {
 
         addMessage('model', data.reply);
 
-        chatHistory.push(
-            { role: 'user', text: prompt },
-            { role: 'model', text: data.reply }
-        );
-
-        chatHistory = chatHistory.slice(-8);
+        if (data.interaction_id) {
+            previousInteractionId = data.interaction_id;
+        }
 
     } catch (error) {
         removeTypingMessage();
@@ -1226,7 +1297,7 @@ document.querySelectorAll('.suggestion').forEach(button => {
 });
 
 clearChatBtn?.addEventListener('click', () => {
-    chatHistory = [];
+    previousInteractionId = null;
 
     chatBox.replaceChildren();
 
