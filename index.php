@@ -22,7 +22,7 @@ session_start();
    1. CONFIGURATION
    ========================================================= */
 
-const AI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const AI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent';
 const MAX_PROMPT_LENGTH = 1200;
 const MAX_HISTORY_ITEMS = 8;
 const RATE_LIMIT_SECONDS = 3;
